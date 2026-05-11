@@ -51,6 +51,35 @@ void McpServer::AddCommonTools() {
                 return std::string(buf);
             });
     }
+    if (board.HasMlx90614()) {
+        AddTool("self.env.mlx90614_measure_body_temperature",
+            "【当用户说「测量体温」或表达测体温、额温、体温度数、红外测温、量一下体温等意图时必须调用本工具】\n"
+            "使用 MLX90614 读取被测物体表面辐射温度（可作额温/体表温度参考）与环境温度，单位摄氏度。\n"
+            "请提示用户将传感器对准额头等部位并保持合适距离；结果为参考值，不能替代医疗体温计诊断。",
+            PropertyList(),
+            [&board](const PropertyList& properties) -> ReturnValue {
+                (void)properties;
+                float obj = 0.0f;
+                float amb = 0.0f;
+                if (!board.Mlx90614ReadBodyTemperature(obj, amb)) {
+                    ESP_LOGW(TAG, "MLX90614 测量失败");
+                    return std::string("{\"success\":false,\"message\":\"mlx90614 read failed\"}");
+                }
+                ESP_LOGI(TAG, "MLX90614 测量: 目标温度 %.2f°C, 环境温度 %.2f°C", (double)obj, (double)amb);
+                char say[192];
+                snprintf(say, sizeof(say),
+                         "红外测温约%.1f摄氏度，环境温度约%.1f摄氏度。如需精确体温请用医用体温计复核。",
+                         (double)obj, (double)amb);
+                char buf[384];
+                snprintf(buf, sizeof(buf),
+                         "{\"success\":true,"
+                         "\"object_celsius\":%.2f,"
+                         "\"ambient_celsius\":%.2f,"
+                         "\"say\":\"%s\"}",
+                         (double)obj, (double)amb, say);
+                return std::string(buf);
+            });
+    }
     if (board.HasEnvironmentSensor() && board.HasFan()) {
         AddTool("self.env.auto_fan_control",
             "根据当前温度和湿度自动调节风扇转速。\n"

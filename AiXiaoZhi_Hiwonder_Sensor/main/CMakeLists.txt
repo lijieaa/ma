@@ -223,11 +223,20 @@ elseif(CONFIG_BOARD_TYPE_LABPLUS_LEDONG_V2)
 elseif(CONFIG_BOARD_TYPE_SURFER_C3_1_14TFT)
     set(BOARD_TYPE "surfer-c3-1.14tft")
 endif()
+# 注意：不可使用 GLOB CONFIGURE_DEPENDS，ESP-IDF 在 component_get_requirements 脚本中会 include 本文件，该模式下不支持。
 file(GLOB BOARD_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/*.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/*.c
 )
 list(APPEND SOURCES ${BOARD_SOURCES})
+# GLOB 在 CMake 缓存未重配时可能漏掉新加的 .c；显式补全避免链接 undefined
+if(BOARD_TYPE STREQUAL "HiwonderExploit_S3")
+    set(_mlx90614_c "${CMAKE_CURRENT_SOURCE_DIR}/boards/HiwonderExploit_S3/mlx90614.c")
+    list(FIND SOURCES "${_mlx90614_c}" _mlx90614_idx)
+    if(_mlx90614_idx EQUAL -1)
+        list(APPEND SOURCES "${_mlx90614_c}")
+    endif()
+endif()
 
 if(CONFIG_USE_AUDIO_PROCESSOR)
     list(APPEND SOURCES "audio/processors/afe_audio_processor.cc")

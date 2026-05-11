@@ -61,6 +61,14 @@ public:
         (void)humidity_rh;
         return false;
     }
+
+    /** MLX90614 等非接触红外测温（如额温/体表辐射温度） */
+    virtual bool HasMlx90614() { return false; }
+    virtual bool Mlx90614ReadBodyTemperature(float& object_celsius, float& ambient_celsius) {
+        (void)object_celsius;
+        (void)ambient_celsius;
+        return false;
+    }
     virtual bool HasLightSensor() { return false; }
     virtual bool GetLightAndProximity(uint16_t& als, uint16_t& ps) {
         (void)als;

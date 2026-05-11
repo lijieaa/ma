@@ -1,1 +1,10 @@
 build/
+.idea
+.config.yaml
+config.yaml
+config_bak.yaml
+.config_bak.yaml
+.env
+.DS_Store
+.vscode
+.devcontainer

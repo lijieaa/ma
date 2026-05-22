@@ -125,6 +125,20 @@ public:
         (void)id;
         return false; 
     }
+    virtual bool SerialServoSetMotorMode(int id) {
+        (void)id;
+        return false;
+    }
+    virtual bool SerialServoSetMotorSpeed(int id, int16_t speed) {
+        (void)id;
+        (void)speed;
+        return false;
+    }
+    virtual int16_t SerialServoGetMotorSpeed() { return 0; }
+    virtual bool SerialServoStopMotor(int id) {
+        (void)id;
+        return false;
+    }
 
 };
 

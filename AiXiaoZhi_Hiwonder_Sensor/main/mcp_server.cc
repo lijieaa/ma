@@ -14,7 +14,12 @@
 #include "display.h"
 #include "board.h"
 #include <cmath>
+#include <thread>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #define TAG "MCP"
+#define SERIAL_SERVO_MOTOR_SPEED_DEFAULT 500
 
 #define DEFAULT_TOOLCALL_STACK_SIZE 6144
 
@@ -452,6 +457,128 @@ void McpServer::AddCommonTools() {
                         }
 
                     });
+
+            AddTool("self.serial_servo.set_motor_speed",
+                "【当用户说「修改电机速度为xx」或「把电机速度改成xx」「电机速度设为xx」「转速调到xx」等"
+                "明确要求设置电机/舵机转速时，必须调用本工具，xx 填入 speed 参数】\n"
+                "设置总线舵机电机模式转速（调用时切换为电机模式并设置速度）。\n"
+                "参数：\n"
+                "  speed：-1000~1000，负值反转，0 为停止转动；\n"
+                "  servo_id：舵机 ID，为 0 时使用已缓存的 ID。\n",
+                PropertyList({
+                    Property("speed", kPropertyTypeInteger, -1000, 1000),
+                    Property("servo_id", kPropertyTypeInteger, 0),
+                }),
+                [this, &board](const PropertyList& properties) -> ReturnValue {
+                    int speed = properties["speed"].value<int>();
+                    int servo_id = properties["servo_id"].value<int>();
+                    if (servo_id == 0) {
+                        servo_id = SerialServoID;
+                    }
+                    if (servo_id < 0) {
+                        return std::string("{\"success\":false,\"message\":\"invalid servo_id, call read_id first\"}");
+                    }
+                    if (!board.SerialServoSetMotorSpeed(servo_id, (int16_t)speed)) {
+                        return std::string("{\"success\":false,\"message\":\"set motor speed failed\"}");
+                    }
+                    SerialServoID = servo_id;
+                    char buf[128];
+                    snprintf(buf, sizeof(buf),
+                             "{\"success\":true,\"servo_id\":%d,\"speed\":%d}",
+                             servo_id, speed);
+                    ESP_LOGI(TAG, "总线舵机电机速度: id=%d speed=%d", servo_id, speed);
+                    return std::string(buf);
+                });
+
+            AddTool("self.serial_servo.get_motor_speed",
+                "【当用户问「电机速度是多少」「当前转速多少」等查询当前电机速度时必须调用本工具】\n"
+                "读取当前总线舵机电机模式下的设定转速（-1000~1000）。",
+                PropertyList(),
+                [&board](const PropertyList& properties) -> ReturnValue {
+                    (void)properties;
+                    int16_t speed = board.SerialServoGetMotorSpeed();
+                    char buf[64];
+                    snprintf(buf, sizeof(buf),
+                             "{\"success\":true,\"speed\":%d}", (int)speed);
+                    return std::string(buf);
+                });
+
+            AddTool("self.serial_servo.stop_motor",
+                "【当用户说「停止电机」「停下电机」「电机停止」「停止舵机」「让电机停下来」等"
+                "要求停止电机或舵机转动时，必须调用本工具】\n"
+                "立即停止总线舵机电机模式下的转动（速度设为 0 并发送停止指令）。\n"
+                "参数 servo_id：为 0 时使用已缓存的舵机 ID。",
+                PropertyList({
+                    Property("servo_id", kPropertyTypeInteger, 0),
+                }),
+                [this, &board](const PropertyList& properties) -> ReturnValue {
+                    int servo_id = properties["servo_id"].value<int>();
+                    if (servo_id == 0) {
+                        servo_id = SerialServoID;
+                    }
+                    if (servo_id < 0) {
+                        return std::string("{\"success\":false,\"message\":\"invalid servo_id, call read_id first\"}");
+                    }
+                    if (!board.SerialServoStopMotor(servo_id)) {
+                        return std::string("{\"success\":false,\"message\":\"stop motor failed\"}");
+                    }
+                    SerialServoID = servo_id;
+                    ESP_LOGI(TAG, "总线舵机电机已停止: id=%d", servo_id);
+                    return std::string("{\"success\":true,\"speed\":0,\"message\":\"motor stopped\"}");
+                });
+
+            AddTool("self.serial_servo.dispense_medicine",
+                "【当用户说「舵机旋转360度，发放一个药品」或「发放一个药品」「出药」「旋转360度发药」等"
+                "相同意图时，必须调用本工具】\n"
+                "先将舵机上电并切换为电机模式，再启动转动发放一粒药品（模拟旋转360度）。"
+                "默认速度500，默认转动2秒后自动停止；上电不会自动进入电机模式。\n"
+                "参数：speed 为0时用500；rotate_duration_ms 为转动毫秒数，0表示不自动停止；"
+                "servo_id 为0时用已缓存ID。",
+                PropertyList({
+                    Property("speed", kPropertyTypeInteger, 0),
+                    Property("rotate_duration_ms", kPropertyTypeInteger, 2000),
+                    Property("servo_id", kPropertyTypeInteger, 0),
+                }),
+                [this, &board](const PropertyList& properties) -> ReturnValue {
+                    int speed = properties["speed"].value<int>();
+                    int duration_ms = properties["rotate_duration_ms"].value<int>();
+                    int servo_id = properties["servo_id"].value<int>();
+                    if (speed == 0) {
+                        speed = SERIAL_SERVO_MOTOR_SPEED_DEFAULT;
+                    }
+                    if (servo_id == 0) {
+                        servo_id = SerialServoID;
+                    }
+                    if (servo_id < 0) {
+                        return std::string("{\"success\":false,\"message\":\"invalid servo_id, call read_id first\"}");
+                    }
+                    if (!board.SerialServoSetMotorMode(servo_id)) {
+                        return std::string("{\"success\":false,\"message\":\"set motor mode failed\"}");
+                    }
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    if (!board.SerialServoSetMotorSpeed(servo_id, (int16_t)speed)) {
+                        return std::string("{\"success\":false,\"message\":\"start motor for dispense failed\"}");
+                    }
+                    SerialServoID = servo_id;
+                    ESP_LOGI(TAG, "发放药品: 电机模式已开启 id=%d speed=%d duration_ms=%d",
+                             servo_id, speed, duration_ms);
+
+                    if (duration_ms > 0) {
+                        std::thread([servo_id, duration_ms]() {
+                            vTaskDelay(pdMS_TO_TICKS(duration_ms));
+                            Board::GetInstance().SerialServoStopMotor(servo_id);
+                            ESP_LOGI(TAG, "发放药品: 转动结束，电机已停止 id=%d", servo_id);
+                        }).detach();
+                    }
+
+                    char buf[256];
+                    snprintf(buf, sizeof(buf),
+                             "{\"success\":true,\"servo_id\":%d,\"motor_mode\":true,\"speed\":%d,"
+                             "\"rotate_duration_ms\":%d,"
+                             "\"say\":\"好的，已切换电机模式，正在旋转发放一粒药品。\"}",
+                             servo_id, speed, duration_ms);
+                    return std::string(buf);
+                });
     }
 
     // ========= 设备状态 / 音量 / 屏幕 =========

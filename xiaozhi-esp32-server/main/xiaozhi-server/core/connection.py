@@ -80,6 +80,13 @@ TOOL_CALLING_RULES = """
 """
 
 
+def _main_llm_is_coze_workflow_run(config) -> bool:
+    """主对话 LLM 是否为扣子工作流 /run（纯对话，不走 MCP 工具注入）。"""
+    llm_name = (config.get("selected_module") or {}).get("LLM", "")
+    llm_cfg = (config.get("LLM") or {}).get(llm_name, {})
+    return llm_cfg.get("type") == "coze_workflow_run"
+
+
 def _extract_plain_query_for_tool_routing(query) -> str:
     """从 ASR/上游可能传入的 JSON 信封中取出用户原句，供关键词与工具路由使用。"""
     if query is None:
@@ -1051,9 +1058,17 @@ class ConnectionHandler:
         ):
             functions = self.func_handler.get_functions()
 
+        # 扣子 /run 由工作流维护对话，不注入 MCP 工具提醒
+        coze_workflow_only = _main_llm_is_coze_workflow_run(self.config)
+
         # 长对话工具调用规则强化：动态生成基于当前可用工具的提醒
         tool_call_reminder = None
-        if depth == 0 and query is not None and functions is not None:
+        if (
+            depth == 0
+            and query is not None
+            and functions is not None
+            and not coze_workflow_only
+        ):
             dialogue_length = len(self.dialogue.dialogue)
             # 当对话历史超过4条消息时，注入规则强化
             if dialogue_length > 4:
@@ -1100,7 +1115,15 @@ class ConnectionHandler:
                 )
                 memory_str = future.result()
 
-            if self.intent_type == "function_call" and functions is not None:
+            if coze_workflow_only:
+                llm_responses = self.llm.response(
+                    self.session_id,
+                    self.dialogue.get_llm_dialogue_with_memory(
+                        memory_str, self.config.get("voiceprint", {})
+                    ),
+                    plain_query=_extract_plain_query_for_tool_routing(query or ""),
+                )
+            elif self.intent_type == "function_call" and functions is not None:
                 from plugins_func.functions.campus_medical_triage import (
                     should_run_deterministic_triage,
                 )
@@ -1181,7 +1204,11 @@ class ConnectionHandler:
             for response in llm_responses:
                 if self.client_abort:
                     break
-                if self.intent_type == "function_call" and functions is not None:
+                if (
+                    self.intent_type == "function_call"
+                    and functions is not None
+                    and not coze_workflow_only
+                ):
                     content, tools_call = response
                     if "content" in response:
                         content = response["content"]

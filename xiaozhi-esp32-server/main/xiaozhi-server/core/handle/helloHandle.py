@@ -17,6 +17,14 @@ from core.providers.tools.device_mcp import MCPClient, send_mcp_initialize_messa
 
 TAG = __name__
 
+
+def _uses_coze_workflow_run(conn: "ConnectionHandler") -> bool:
+    """当前主 LLM 是否为扣子工作流 /run 对接。"""
+    llm_name = (conn.config.get("selected_module") or {}).get("LLM", "")
+    llm_cfg = (conn.config.get("LLM") or {}).get(llm_name, {})
+    return llm_cfg.get("type") == "coze_workflow_run"
+
+
 WAKEUP_CONFIG = {
     "refresh_time": 10,
     "responses": [
@@ -61,6 +69,10 @@ async def handleHelloMessage(conn: "ConnectionHandler", msg_json):
 
 
 async def checkWakeupWords(conn: "ConnectionHandler", text):
+    # 使用扣子工作流时，唤醒词走 LLM（CozeWorkflowRunLLM），不播本地缓存
+    if _uses_coze_workflow_run(conn):
+        return False
+
     enable_wakeup_words_response_cache = conn.config[
         "enable_wakeup_words_response_cache"
     ]

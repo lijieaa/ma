@@ -17,6 +17,7 @@ from core.utils.util import (
     check_vad_update,
     check_asr_update,
     filter_sensitive_info,
+    sanitize_tool_name,
 )
 from typing import Any, Dict, Optional
 from collections import deque
@@ -146,11 +147,204 @@ def _find_mlx90614_body_temperature_tool_name(functions) -> Optional[str]:
     return None
 
 
+def _coze_workflow_reply_needs_mlx_measure(ai_reply: str) -> bool:
+    """扣子工作流话术：引导用户靠近测温区后触发 MLX90614。"""
+    t = (ai_reply or "").strip()
+    if not t:
+        return False
+    return "靠近我的测温区" in t or "请把你的手或头部靠近" in t
+
+
+def _coze_workflow_reply_needs_dispense_medicine(ai_reply: str) -> bool:
+    """扣子工作流话术：确认发放碘伏敷料后触发舵机出药。"""
+    t = (ai_reply or "").strip()
+    if not t:
+        return False
+    return ("碘伏和敷料贴" in t or "自助外用药品领取" in t) and "发放" in t
+
+
+def _wait_device_mcp_ready_sync(conn, timeout: float = 5.0) -> bool:
+    mc = getattr(conn, "mcp_client", None)
+    loop = getattr(conn, "loop", None)
+    if not mc or not loop:
+        return False
+
+    async def _poll():
+        for _ in range(max(1, int(timeout * 10))):
+            if await mc.is_ready():
+                return True
+            await asyncio.sleep(0.1)
+        return False
+
+    try:
+        return asyncio.run_coroutine_threadsafe(_poll(), loop).result(
+            timeout=timeout + 1.0
+        )
+    except Exception:
+        return False
+
+
+def _iter_registered_tool_names(conn):
+    seen = set()
+    fh = getattr(conn, "func_handler", None)
+    if fh:
+        try:
+            fh.tool_manager.refresh_tools()
+            for key in fh.tool_manager.get_all_tools().keys():
+                if key not in seen:
+                    seen.add(key)
+                    yield key
+        except Exception:
+            pass
+    mc = getattr(conn, "mcp_client", None)
+    if mc and getattr(mc, "tools", None):
+        for key in mc.tools.keys():
+            if key not in seen:
+                seen.add(key)
+                yield key
+
+
+def _resolve_device_mcp_tool_name(
+    conn, *needles: str, canonical_dot_name: Optional[str] = None
+) -> Optional[str]:
+    """
+    在 tool_manager / mcp_client 中解析设备 MCP 工具名（多为 sanitize 后的下划线名）。
+    """
+    needles_l = [n.lower() for n in needles if n]
+    if not needles_l:
+        return None
+
+    def _match(name: str) -> bool:
+        low = name.lower()
+        return all(n in low for n in needles_l)
+
+    fh = getattr(conn, "func_handler", None)
+    for name in _iter_registered_tool_names(conn):
+        if _match(name) and (not fh or fh.has_tool(name)):
+            return name
+
+    if canonical_dot_name:
+        for candidate in (
+            canonical_dot_name,
+            sanitize_tool_name(canonical_dot_name),
+        ):
+            mc = getattr(conn, "mcp_client", None)
+            if mc and mc.has_tool(candidate):
+                if not fh or fh.has_tool(candidate):
+                    return candidate
+                # 缓存未同步时仍返回 mcp_client 已知的名称
+                return candidate
+    return None
+
+
+def _resolve_dispense_medicine_tool_name(conn, functions=None) -> Optional[str]:
+    return _resolve_device_mcp_tool_name(
+        conn,
+        "dispense_medicine",
+        canonical_dot_name="self.serial_servo.dispense_medicine",
+    )
+
+
+def _log_serial_servo_tools_missing(conn, context: str):
+    names = [
+        n
+        for n in _iter_registered_tool_names(conn)
+        if "serial" in n.lower() or "servo" in n.lower() or "dispense" in n.lower()
+    ]
+    conn.logger.bind(tag=TAG).warning(
+        "%s；当前设备 serial/servo 相关工具: %s"
+        % (context, names if names else "(无，请确认固件已烧录且 UART 舵机已连接)")
+    )
+
+
+def _coze_workflow_reply_side_effect_tool_calls(conn, ai_reply: str) -> list:
+    """扣子 /run 固定回复触发的设备 MCP（不经过 LLM function_call）。"""
+    calls = []
+    if not (ai_reply or "").strip():
+        return calls
+    fh = getattr(conn, "func_handler", None)
+    if not fh or not fh.finish_init:
+        return calls
+
+    _wait_device_mcp_ready_sync(conn)
+    fh.tool_manager.refresh_tools()
+    functions = fh.get_functions()
+
+    if _coze_workflow_reply_needs_mlx_measure(ai_reply):
+        mlx_tool = _resolve_mlx90614_tool_name(conn, functions)
+        if not mlx_tool:
+            mlx_tool = _resolve_device_mcp_tool_name(
+                conn,
+                "mlx90614",
+                "measure",
+                canonical_dot_name="self.env.mlx90614_measure_body_temperature",
+            )
+        if mlx_tool and fh.has_tool(mlx_tool):
+            conn.logger.bind(tag=TAG).info(
+                "扣子工作流话术触发设备 MCP 测温: %s" % mlx_tool
+            )
+            calls.append(
+                {
+                    "id": uuid.uuid4().hex,
+                    "name": mlx_tool,
+                    "arguments": "{}",
+                }
+            )
+        else:
+            conn.logger.bind(tag=TAG).warning(
+                "扣子测温话术命中，但未找到 self.env.mlx90614_measure_body_temperature"
+            )
+
+    if _coze_workflow_reply_needs_dispense_medicine(ai_reply):
+        disp_tool = _resolve_dispense_medicine_tool_name(conn, functions)
+        if disp_tool and fh.has_tool(disp_tool):
+            conn.logger.bind(tag=TAG).info(
+                "扣子工作流话术触发设备 MCP 出药: %s" % disp_tool
+            )
+            calls.append(
+                {
+                    "id": uuid.uuid4().hex,
+                    "name": disp_tool,
+                    "arguments": "{}",
+                }
+            )
+        else:
+            _log_serial_servo_tools_missing(
+                conn,
+                "扣子出药话术命中，但未找到 dispense_medicine（需设备 MCP 暴露该工具）",
+            )
+
+    return calls
+
+
+def _extract_tool_json_say(text: str) -> Optional[str]:
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        inner = json.loads(raw)
+        if isinstance(inner, dict):
+            say = inner.get("say")
+            if isinstance(say, str) and say.strip():
+                return say.strip()
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return None
+
+
 def _resolve_mlx90614_tool_name(conn, functions) -> Optional[str]:
     """结合 functions 列表与 tool_manager 全量表解析 MLX 工具名（缓解缓存/MCP 竞态）。"""
     name = _find_mlx90614_body_temperature_tool_name(functions)
     if name and getattr(conn, "func_handler", None) and conn.func_handler.has_tool(name):
         return name
+    resolved = _resolve_device_mcp_tool_name(
+        conn,
+        "mlx90614",
+        "measure",
+        canonical_dot_name="self.env.mlx90614_measure_body_temperature",
+    )
+    if resolved:
+        return resolved
     fh = getattr(conn, "func_handler", None)
     if not fh:
         return None
@@ -194,6 +388,10 @@ def _parse_coze_marker_function_call(content: str) -> Optional[Dict[str, str]]:
 def _is_mlx90614_body_temperature_tool(tool_name: str) -> bool:
     low = (tool_name or "").lower()
     return "measure_body_temperature" in low and "mlx90614" in low
+
+
+def _is_dispense_medicine_tool(tool_name: str) -> bool:
+    return "dispense_medicine" in (tool_name or "").lower()
 
 
 def _format_mlx90614_tool_result_for_llm(tool_name: str, text: str) -> str:
@@ -1274,6 +1472,21 @@ class ConnectionHandler:
                     )
                 )
             return
+
+        # 扣子 /run：按工作流固定话术触发设备 MCP（不测用户意图、不注入 tool_calling）
+        if (
+            coze_workflow_only
+            and depth == 0
+            and not tool_call_flag
+            and len(response_message) > 0
+        ):
+            side_calls = _coze_workflow_reply_side_effect_tool_calls(
+                self, "".join(response_message)
+            )
+            if side_calls:
+                tool_call_flag = True
+                tool_calls_list = side_calls
+
         # 处理function call
         if tool_call_flag:
             bHasError = False
@@ -1462,6 +1675,43 @@ class ConnectionHandler:
                 need_llm_tools.append((result, tool_call_data))
             else:
                 pass
+
+        if need_llm_tools and _main_llm_is_coze_workflow_run(self.config):
+            remaining = []
+            for result, tool_call_data in need_llm_tools:
+                tool_name = tool_call_data.get("name") or ""
+                if _is_mlx90614_body_temperature_tool(tool_name):
+                    say = _extract_tool_json_say(result.result)
+                    if not say and result.result:
+                        try:
+                            inner = json.loads((result.result or "").strip())
+                            if isinstance(inner, dict):
+                                oc = inner.get("object_celsius")
+                                ac = inner.get("ambient_celsius")
+                                if oc is not None and ac is not None:
+                                    say = (
+                                        f"红外测温约{oc}摄氏度，环境温度约{ac}摄氏度。"
+                                        "如需精确体温请用医用体温计复核。"
+                                    )
+                        except (json.JSONDecodeError, TypeError, ValueError):
+                            pass
+                    if say:
+                        self.tts.tts_one_sentence(
+                            self, ContentType.TEXT, content_detail=say
+                        )
+                        self.dialogue.put(
+                            Message(role="assistant", content=say)
+                        )
+                    continue
+                if _is_dispense_medicine_tool(tool_name):
+                    if result.action == Action.ERROR:
+                        text = result.response or result.result or "出药失败"
+                        self.tts.tts_one_sentence(
+                            self, ContentType.TEXT, content_detail=text
+                        )
+                    continue
+                remaining.append((result, tool_call_data))
+            need_llm_tools = remaining
 
         if need_llm_tools:
             all_tool_calls = [

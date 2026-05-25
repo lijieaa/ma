@@ -168,6 +168,8 @@ class LLMProvider(LLMProviderBase):
     def response(self, session_id, dialogue, **kwargs) -> Generator[str, None, None]:
         plain_query = (kwargs.get("plain_query") or "").strip()
         user_message = _extract_user_message(dialogue, plain_query)
+        if plain_query:
+            user_message = plain_query
         if not user_message.strip():
             yield ""
             return

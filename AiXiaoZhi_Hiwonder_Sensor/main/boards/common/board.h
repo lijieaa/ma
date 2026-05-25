@@ -101,6 +101,8 @@ public:
     virtual bool MatrixDisplayScroll(const uint8_t* data, size_t len) { (void)data; (void)len; return false; }
 
     //SerialBusServo
+    /** UART 总线舵机通信已初始化（不要求已读到 ID） */
+    virtual bool HasSerialServoBus() { return false; }
     virtual bool HasSerialServo() { return false; }
     virtual bool SerialServoSetPosition(int id, uint16_t position, uint16_t time) {
         (void)id;

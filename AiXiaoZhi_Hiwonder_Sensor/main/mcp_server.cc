@@ -364,8 +364,8 @@ void McpServer::AddCommonTools() {
             });
     }
 
-    //总线舵机控制工具
-    if(board.HasSerialServo()){
+    //总线舵机控制工具（UART 就绪即注册；出药时再尝试读 ID）
+    if(board.HasSerialServoBus()){
         AddTool("self.serial_servo.read_id",
             "读取总线舵机的ID,当ID为-2048时表示读取失败\n",
             PropertyList(),   
@@ -548,6 +548,14 @@ void McpServer::AddCommonTools() {
                     }
                     if (servo_id == 0) {
                         servo_id = SerialServoID;
+                    }
+                    if (servo_id < 0) {
+                        int id_tmp = -1;
+                        if (board.SerialServoReadID(id_tmp)) {
+                            servo_id = id_tmp;
+                            SerialServoID = id_tmp;
+                            ESP_LOGI(TAG, "dispense_medicine: lazy read servo id=%d", servo_id);
+                        }
                     }
                     if (servo_id < 0) {
                         return std::string("{\"success\":false,\"message\":\"invalid servo_id, call read_id first\"}");

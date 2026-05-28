@@ -112,6 +112,10 @@ def _user_intent_body_temperature_measure(query: str) -> bool:
     """与设备端 MLX90614 工具描述中的触发语对齐（用于无 OpenAI tool_calls 的 LLM 后端）。"""
     if not query:
         return False
+    if _user_voice_command_start_mlx_module(query):
+        return True
+    if _user_voice_command_open_mlx_temp_feature(query):
+        return True
     if "mlx90614" in query.lower():
         return True
     needles = (
@@ -128,6 +132,268 @@ def _user_intent_body_temperature_measure(query: str) -> bool:
         "给我测",
     )
     return any(n in query for n in needles)
+
+
+def _normalize_voice_command_text(text: str) -> str:
+    """纠正常见 ASR 同音误识别，便于命中固定 MCP 指令。"""
+    t = (text or "").strip().replace(" ", "")
+    for src, dst in (
+        ("舵肌", "舵机"),
+        ("多机", "舵机"),
+        ("簸箕", "舵机"),
+        ("分发", "发放"),
+        ("发一个药", "发放一个药品"),
+        ("出药", "发放一个药品"),
+        ("赞一个药", "发放一个药品"),
+        ("换一个药", "发放一个药品"),
+        ("设体温", "测体温"),
+        ("侧温", "测温"),
+        ("直接分放", "直接发放"),
+    ):
+        t = t.replace(src, dst)
+    return t
+
+
+def _func_handler_ready_for_device_mcp(conn) -> bool:
+    fh = getattr(conn, "func_handler", None)
+    if not fh:
+        return False
+    if fh.finish_init:
+        return True
+    mc = getattr(conn, "mcp_client", None)
+    return bool(mc and getattr(mc, "tools", None))
+
+
+def _user_voice_command_start_mlx_module(query: str) -> bool:
+    """直连 MCP 指令一：启动测温模块，报出体温数据。"""
+    t = _normalize_voice_command_text(query)
+    if not t:
+        return False
+    if "启动测温模块，报出体温数据" in t:
+        return True
+    return "启动测温模块" in t and ("报出体温" in t or "体温数据" in t)
+
+
+def _user_voice_command_open_mlx_temp_feature(query: str) -> bool:
+    """直连 MCP：打开测温功能（MLX90614）。"""
+    t = _normalize_voice_command_text(query)
+    if not t:
+        return False
+    if "打开测温功能" in t:
+        return True
+    return "打开" in t and "测温" in t and "功能" in t
+
+
+def _user_voice_command_dispense_medicine_360(query: str) -> bool:
+    """直连 MCP 指令二：舵机旋转360度，发放一个药品（兼容 ASR 误识别）。"""
+    t = _normalize_voice_command_text(query)
+    if not t:
+        return False
+    if "舵机旋转360度，发放一个药品" in t:
+        return True
+    if "360度发" in t and ("舵机" in t or "舵" in t):
+        return True
+    has_rotate = "旋转360度" in t or (
+        "360度" in t and ("旋转" in t or "转" in t)
+    )
+    has_dispense = "发放" in t and ("药品" in t or "药" in t)
+    has_servo = "舵机" in t
+    return (has_rotate and has_dispense) or (has_servo and has_dispense and "360" in t)
+
+
+def _user_voice_command_direct_dispense_medicine(query: str) -> bool:
+    """直连 MCP：直接发放药品（舵机旋转 360 度出药）。"""
+    t = _normalize_voice_command_text(query)
+    if not t:
+        return False
+    if "直接发放药品" in t:
+        return True
+    return "直接" in t and "发放" in t and ("药品" in t or "药" in t)
+
+
+def _user_voice_command_adjust_volume(query: str) -> bool:
+    """调节设备扬声器音量（设备 MCP self.audio_speaker.set_volume）。"""
+    t = _normalize_voice_command_text(query)
+    if "音量" not in t and "声音" not in t:
+        return False
+    return any(
+        k in t
+        for k in (
+            "调",
+            "高",
+            "低",
+            "大",
+            "小",
+            "响",
+            "轻",
+            "设置",
+            "一点",
+            "百分之",
+            "%",
+        )
+    )
+
+
+def _volume_arguments_from_voice_command(query: str) -> dict:
+    t = _normalize_voice_command_text(query)
+    m = re.search(r"音量?\s*到?\s*(\d{1,3})", t)
+    if not m:
+        m = re.search(r"(\d{1,3})\s*%", t)
+    if m:
+        return {"volume": min(100, max(0, int(m.group(1))))}
+    if any(k in t for k in ("调高", "调大", "大一点", "大声", "响一点", "加大", "高一些")):
+        return {"volume": 85}
+    if any(k in t for k in ("调低", "调小", "小声", "轻一点", "减小", "低一些")):
+        return {"volume": 35}
+    return {"volume": 75}
+
+
+def _resolve_set_volume_tool_name(conn, functions=None) -> Optional[str]:
+    return _resolve_device_mcp_tool_name(
+        conn,
+        "set_volume",
+        "audio_speaker",
+        canonical_dot_name="self.audio_speaker.set_volume",
+    )
+
+
+def _is_set_volume_tool(tool_name: str) -> bool:
+    low = (tool_name or "").lower()
+    return "set_volume" in low and "audio" in low
+
+
+def _speak_direct_mcp_tool_result(conn, tool_name: str, result) -> None:
+    if result.action == Action.ERROR:
+        text = result.response or result.result or "操作失败"
+        conn.tts.tts_one_sentence(conn, ContentType.TEXT, content_detail=text)
+        conn.dialogue.put(Message(role="assistant", content=text))
+        return
+    say = _extract_tool_json_say(result.result)
+    if not say and result.result:
+        raw = (result.result or "").strip()
+        try:
+            inner = json.loads(raw)
+            if isinstance(inner, dict):
+                say = inner.get("message") or inner.get("say")
+                if isinstance(say, str):
+                    say = say.strip()
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    if not say and result.response:
+        say = str(result.response).strip()
+    if say:
+        conn.tts.tts_one_sentence(conn, ContentType.TEXT, content_detail=say)
+        conn.dialogue.put(Message(role="assistant", content=say))
+
+
+def _build_direct_mcp_voice_command_calls(conn, plain_query: str) -> list:
+    """解析固定语音指令，返回待执行的 MCP tool_calls 列表。"""
+    if not (plain_query or "").strip():
+        return []
+    if not _func_handler_ready_for_device_mcp(conn):
+        return []
+
+    fh = conn.func_handler
+    _wait_device_mcp_ready_sync(conn, timeout=8.0)
+    fh.tool_manager.refresh_tools()
+    functions = fh.get_functions()
+    norm = _normalize_voice_command_text(plain_query)
+
+    if _user_voice_command_start_mlx_module(norm):
+        mlx_tool = _resolve_mlx90614_tool_name(conn, functions)
+        if mlx_tool and fh.has_tool(mlx_tool):
+            conn.logger.bind(tag=TAG).info(
+                "命中语音指令「启动测温模块，报出体温数据」"
+            )
+            return [
+                {
+                    "id": uuid.uuid4().hex,
+                    "name": mlx_tool,
+                    "arguments": "{}",
+                }
+            ]
+        conn.logger.bind(tag=TAG).warning(
+            "指令「启动测温模块，报出体温数据」命中，但未找到 MLX90614 测温工具"
+        )
+        return []
+
+    if _user_voice_command_open_mlx_temp_feature(norm):
+        mlx_tool = _resolve_mlx90614_tool_name(conn, functions)
+        if mlx_tool and fh.has_tool(mlx_tool):
+            conn.logger.bind(tag=TAG).info(
+                "命中语音指令「打开测温功能」(ASR原文: %s)" % plain_query
+            )
+            return [
+                {
+                    "id": uuid.uuid4().hex,
+                    "name": mlx_tool,
+                    "arguments": "{}",
+                }
+            ]
+        conn.logger.bind(tag=TAG).warning(
+            "指令「打开测温功能」命中，但未找到 MLX90614 测温工具"
+        )
+        return []
+
+    if _user_voice_command_dispense_medicine_360(norm):
+        disp_tool = _resolve_dispense_medicine_tool_name(conn, functions)
+        if disp_tool and fh.has_tool(disp_tool):
+            conn.logger.bind(tag=TAG).info(
+                "命中语音指令「舵机旋转360度，发放一个药品」(ASR原文: %s)"
+                % plain_query
+            )
+            return [
+                {
+                    "id": uuid.uuid4().hex,
+                    "name": disp_tool,
+                    "arguments": "{}",
+                }
+            ]
+        _log_serial_servo_tools_missing(
+            conn,
+            "指令「舵机旋转360度，发放一个药品」命中，但未找到 dispense_medicine 工具",
+        )
+        return []
+
+    if _user_voice_command_direct_dispense_medicine(norm):
+        disp_tool = _resolve_dispense_medicine_tool_name(conn, functions)
+        if disp_tool and fh.has_tool(disp_tool):
+            conn.logger.bind(tag=TAG).info(
+                "命中语音指令「直接发放药品」(ASR原文: %s)" % plain_query
+            )
+            return [
+                {
+                    "id": uuid.uuid4().hex,
+                    "name": disp_tool,
+                    "arguments": "{}",
+                }
+            ]
+        _log_serial_servo_tools_missing(
+            conn,
+            "指令「直接发放药品」命中，但未找到 dispense_medicine 工具",
+        )
+        return []
+
+    if _user_voice_command_adjust_volume(norm):
+        vol_tool = _resolve_set_volume_tool_name(conn, functions)
+        if vol_tool and fh.has_tool(vol_tool):
+            vol_args = _volume_arguments_from_voice_command(norm)
+            conn.logger.bind(tag=TAG).info(
+                "命中语音指令调节音量: %s -> %s" % (plain_query, vol_args)
+            )
+            return [
+                {
+                    "id": uuid.uuid4().hex,
+                    "name": vol_tool,
+                    "arguments": json.dumps(vol_args, ensure_ascii=False),
+                }
+            ]
+        conn.logger.bind(tag=TAG).warning(
+            "音量调节指令命中，但未找到 self.audio_speaker.set_volume"
+        )
+        return []
+
+    return []
 
 
 def _find_mlx90614_body_temperature_tool_name(functions) -> Optional[str]:
@@ -1202,6 +1468,9 @@ class ConnectionHandler:
                     content_type=ContentType.ACTION,
                 )
             )
+            plain_query = _extract_plain_query_for_tool_routing(query or "")
+            if self._try_run_direct_mcp_voice_command(plain_query, depth=depth):
+                return True
 
         # 设置最大递归深度，避免无限循环，可根据实际需求调整
         MAX_DEPTH = 5
@@ -1637,6 +1906,83 @@ class ConnectionHandler:
 
         return True
 
+    def _try_run_direct_mcp_voice_command(self, plain_query: str, depth: int = 0) -> bool:
+        """固定语音指令直连设备 MCP，跳过 LLM/扣子。"""
+        tool_calls_list = _build_direct_mcp_voice_command_calls(self, plain_query)
+        if not tool_calls_list:
+            return False
+        self._run_mcp_tool_calls(tool_calls_list, depth=depth)
+        return True
+
+    def _run_mcp_tool_calls(self, tool_calls_list: list, depth: int = 0):
+        if not tool_calls_list or not getattr(self, "func_handler", None):
+            return
+
+        futures_with_data = []
+        for tool_call_data in tool_calls_list:
+            tool_input = json.loads(tool_call_data.get("arguments") or "{}")
+            enqueue_tool_report(self, tool_call_data["name"], tool_input)
+            future = asyncio.run_coroutine_threadsafe(
+                self.func_handler.handle_llm_function_call(self, tool_call_data),
+                self.loop,
+            )
+            futures_with_data.append((future, tool_call_data, tool_input))
+
+        tool_call_timeout = int(self.config.get("tool_call_timeout", 30))
+        tool_results = []
+        for future, tool_call_data, tool_input in futures_with_data:
+            try:
+                result = future.result(timeout=tool_call_timeout)
+                tool_results.append((result, tool_call_data))
+                enqueue_tool_report(
+                    self,
+                    tool_call_data["name"],
+                    tool_input,
+                    str(result.result) if result.result else None,
+                    report_tool_call=False,
+                )
+            except Exception as e:
+                self.logger.bind(tag=TAG).error(
+                    "工具调用超时或异常: %s, 错误: %s"
+                    % (tool_call_data.get("name"), e)
+                )
+                tool_results.append(
+                    (
+                        ActionResponse(
+                            action=Action.ERROR,
+                            result="哎呀，网络遇到点问题，请稍后再试下！",
+                        ),
+                        tool_call_data,
+                    )
+                )
+                enqueue_tool_report(
+                    self,
+                    tool_call_data["name"],
+                    tool_input,
+                    str(e),
+                    report_tool_call=False,
+                )
+
+        if tool_results:
+            self._handle_function_result(tool_results, depth=depth)
+            for result, tool_call_data in tool_results:
+                tool_name = tool_call_data.get("name") or ""
+                if _is_mlx90614_body_temperature_tool(tool_name):
+                    continue
+                if _is_dispense_medicine_tool(tool_name) or _is_set_volume_tool(
+                    tool_name
+                ):
+                    _speak_direct_mcp_tool_result(self, tool_name, result)
+
+        if depth == 0:
+            self.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=self.sentence_id,
+                    sentence_type=SentenceType.LAST,
+                    content_type=ContentType.ACTION,
+                )
+            )
+
     def _get_tool_summary(self, functions: list) -> str:
         """
         从工具定义中提取摘要，用于规则强化注入
@@ -1709,6 +2055,9 @@ class ConnectionHandler:
                         self.tts.tts_one_sentence(
                             self, ContentType.TEXT, content_detail=text
                         )
+                    continue
+                if _is_set_volume_tool(tool_name):
+                    _speak_direct_mcp_tool_result(self, tool_name, result)
                     continue
                 remaining.append((result, tool_call_data))
             need_llm_tools = remaining

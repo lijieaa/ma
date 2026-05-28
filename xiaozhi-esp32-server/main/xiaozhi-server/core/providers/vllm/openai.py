@@ -34,12 +34,19 @@ class VLLMProvider(VLLMProviderBase):
             except (ValueError, TypeError):
                 setattr(self, param, default)
 
-        model_key_msg = check_model_key("VLLM", self.api_key)
-        if model_key_msg:
-            logger.bind(tag=TAG).error(model_key_msg)
-        self.client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
+        self.model_key_msg = check_model_key("VLLM", self.api_key or "")
+        if self.model_key_msg:
+            logger.bind(tag=TAG).error(self.model_key_msg)
+            self.client = None
+        else:
+            self.client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
 
     def response(self, question, base64_image):
+        if self.model_key_msg or not self.client:
+            raise ValueError(
+                "视觉大模型 API Key 未配置。请在 data/.config.yaml 的 VLLM 节点填写有效 api_key，"
+                "例如智谱 glm-4v：https://bigmodel.cn/usercenter/proj-mgmt/apikeys"
+            )
         question = question + "(请使用中文回复)"
         try:
             messages = [

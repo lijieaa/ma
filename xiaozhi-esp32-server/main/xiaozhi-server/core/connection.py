@@ -137,6 +137,7 @@ def _user_intent_body_temperature_measure(query: str) -> bool:
 def _normalize_voice_command_text(text: str) -> str:
     """纠正常见 ASR 同音误识别，便于命中固定 MCP 指令。"""
     t = (text or "").strip().replace(" ", "")
+    t = re.sub(r"[。，、！？；：．,\!\?\;]+", "", t)
     for src, dst in (
         ("舵肌", "舵机"),
         ("多机", "舵机"),
@@ -149,6 +150,8 @@ def _normalize_voice_command_text(text: str) -> str:
         ("设体温", "测体温"),
         ("侧温", "测温"),
         ("直接分放", "直接发放"),
+        ("摄像图", "摄像头"),
+        ("设像头", "摄像头"),
     ):
         t = t.replace(src, dst)
     return t
@@ -211,6 +214,40 @@ def _user_voice_command_direct_dispense_medicine(query: str) -> bool:
     return "直接" in t and "发放" in t and ("药品" in t or "药" in t)
 
 
+def _user_voice_command_camera_take_photo(query: str) -> bool:
+    """直连 MCP：打开摄像头拍照并由视觉接口描述画面（self.camera.take_photo）。"""
+    t = _normalize_voice_command_text(query)
+    if not t or "测温" in t:
+        return False
+    if any(
+        k in t
+        for k in (
+            "打开摄像头",
+            "开启摄像头",
+            "开摄像头",
+            "启动摄像头",
+        )
+    ):
+        return True
+    if "摄像头" in t and any(k in t for k in ("打开", "开启", "启动", "开")):
+        return True
+    if t in ("拍照", "拍张照片", "拍一张照", "拍个照"):
+        return True
+    if ("看到什么" in t or "看到了什么" in t or "看见什么" in t) and (
+        "摄像" in t or "拍照" in t or "镜头" in t
+    ):
+        return True
+    return False
+
+
+def _camera_question_from_voice_command(query: str) -> str:
+    """从用户话术提取视觉提问，默认描述画面。"""
+    t = _normalize_voice_command_text(query)
+    if "什么" in t or "看到" in t or "看见" in t:
+        return "请描述一下你看到的画面。"
+    return "描述一下看到的物品"
+
+
 def _user_voice_command_adjust_volume(query: str) -> bool:
     """调节设备扬声器音量（设备 MCP self.audio_speaker.set_volume）。"""
     t = _normalize_voice_command_text(query)
@@ -262,9 +299,36 @@ def _is_set_volume_tool(tool_name: str) -> bool:
     return "set_volume" in low and "audio" in low
 
 
+def _friendly_device_mcp_say(text: str) -> str:
+    """将设备/视觉接口的技术错误转为可播报的中文说明。"""
+    raw = (text or "").strip()
+    if not raw:
+        return "操作失败，请稍后再试。"
+    low = raw.lower()
+    if (
+        "api key" in low
+        or "api_key" in low
+        or "你的api" in raw
+        or "配置错误" in raw
+        or "未配置" in raw
+        or "codec" in low
+        or "encode" in low
+    ):
+        return (
+            "视觉功能还没有配置好。请在服务器 data/.config.yaml 里设置 "
+            "selected_module.VLLM 和 VLLM.ChatGLMVLLM.api_key（智谱等视觉模型密钥），"
+            "然后重启服务。"
+        )
+    if len(raw) > 150:
+        return raw[:150] + "…"
+    return raw
+
+
 def _speak_direct_mcp_tool_result(conn, tool_name: str, result) -> None:
     if result.action == Action.ERROR:
-        text = result.response or result.result or "操作失败"
+        text = _friendly_device_mcp_say(
+            result.response or result.result or "操作失败"
+        )
         conn.tts.tts_one_sentence(conn, ContentType.TEXT, content_detail=text)
         conn.dialogue.put(Message(role="assistant", content=text))
         return
@@ -279,9 +343,12 @@ def _speak_direct_mcp_tool_result(conn, tool_name: str, result) -> None:
                     say = say.strip()
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
+    if not say:
+        say = _extract_vision_response_say(result.result)
     if not say and result.response:
         say = str(result.response).strip()
     if say:
+        say = _friendly_device_mcp_say(say)
         conn.tts.tts_one_sentence(conn, ContentType.TEXT, content_detail=say)
         conn.dialogue.put(Message(role="assistant", content=say))
 
@@ -390,6 +457,28 @@ def _build_direct_mcp_voice_command_calls(conn, plain_query: str) -> list:
             ]
         conn.logger.bind(tag=TAG).warning(
             "音量调节指令命中，但未找到 self.audio_speaker.set_volume"
+        )
+        return []
+
+    if _user_voice_command_camera_take_photo(norm):
+        cam_tool = _resolve_take_photo_tool_name(conn, functions)
+        if cam_tool and fh.has_tool(cam_tool):
+            cam_args = {
+                "question": _camera_question_from_voice_command(norm),
+            }
+            conn.logger.bind(tag=TAG).info(
+                "命中语音指令「打开摄像头/拍照」(ASR原文: %s) -> %s"
+                % (plain_query, cam_args)
+            )
+            return [
+                {
+                    "id": uuid.uuid4().hex,
+                    "name": cam_tool,
+                    "arguments": json.dumps(cam_args, ensure_ascii=False),
+                }
+            ]
+        conn.logger.bind(tag=TAG).warning(
+            "指令「打开摄像头」命中，但未找到 self.camera.take_photo（需设备接摄像头且 MCP 已注册）"
         )
         return []
 
@@ -596,6 +685,43 @@ def _extract_tool_json_say(text: str) -> Optional[str]:
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
     return None
+
+
+def _extract_vision_response_say(text: str) -> Optional[str]:
+    """解析 take_photo / 视觉接口返回的 JSON（含 response 字段）。"""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    try:
+        inner = json.loads(raw)
+        if isinstance(inner, dict):
+            if inner.get("success") is False:
+                msg = inner.get("message")
+                raw = msg.strip() if isinstance(msg, str) and msg.strip() else "视觉分析失败"
+                return _friendly_device_mcp_say(raw)
+            resp = inner.get("response")
+            if isinstance(resp, str) and resp.strip():
+                return resp.strip()
+            msg = inner.get("message") or inner.get("say")
+            if isinstance(msg, str) and msg.strip():
+                return msg.strip()
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _resolve_take_photo_tool_name(conn, functions=None) -> Optional[str]:
+    return _resolve_device_mcp_tool_name(
+        conn,
+        "take_photo",
+        "camera",
+        canonical_dot_name="self.camera.take_photo",
+    )
+
+
+def _is_take_photo_tool(tool_name: str) -> bool:
+    low = (tool_name or "").lower()
+    return "take_photo" in low and "camera" in low
 
 
 def _resolve_mlx90614_tool_name(conn, functions) -> Optional[str]:
@@ -1969,8 +2095,10 @@ class ConnectionHandler:
                 tool_name = tool_call_data.get("name") or ""
                 if _is_mlx90614_body_temperature_tool(tool_name):
                     continue
-                if _is_dispense_medicine_tool(tool_name) or _is_set_volume_tool(
-                    tool_name
+                if (
+                    _is_dispense_medicine_tool(tool_name)
+                    or _is_set_volume_tool(tool_name)
+                    or _is_take_photo_tool(tool_name)
                 ):
                     _speak_direct_mcp_tool_result(self, tool_name, result)
 
@@ -2058,6 +2186,15 @@ class ConnectionHandler:
                     continue
                 if _is_set_volume_tool(tool_name):
                     _speak_direct_mcp_tool_result(self, tool_name, result)
+                    continue
+                if _is_take_photo_tool(tool_name):
+                    if result.action == Action.ERROR:
+                        text = result.response or result.result or "拍照失败"
+                        self.tts.tts_one_sentence(
+                            self, ContentType.TEXT, content_detail=text
+                        )
+                    else:
+                        _speak_direct_mcp_tool_result(self, tool_name, result)
                     continue
                 remaining.append((result, tool_call_data))
             need_llm_tools = remaining

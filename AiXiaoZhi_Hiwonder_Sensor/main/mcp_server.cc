@@ -641,6 +641,7 @@ void McpServer::AddCommonTools() {
 
     if (camera) {
         AddTool("self.camera.take_photo",
+            "【当用户说「打开摄像头」「拍照」「拍张照片」或「说说你看到了什么」等时必须调用本工具】\n"
             "拍一张照片并用文字解释当前画面。\n"
             "调用后你会得到一段对画面的解释文字，\n"
             "你可以把这段文字读给用户听，告诉他你看到了什么。\n"

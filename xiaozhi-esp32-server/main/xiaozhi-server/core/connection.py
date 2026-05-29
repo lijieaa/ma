@@ -413,7 +413,7 @@ def _build_direct_mcp_voice_command_calls(conn, plain_query: str) -> list:
                 {
                     "id": uuid.uuid4().hex,
                     "name": disp_tool,
-                    "arguments": "{}",
+                    "arguments": _dispense_medicine_tool_arguments(),
                 }
             ]
         _log_serial_servo_tools_missing(
@@ -432,7 +432,7 @@ def _build_direct_mcp_voice_command_calls(conn, plain_query: str) -> list:
                 {
                     "id": uuid.uuid4().hex,
                     "name": disp_tool,
-                    "arguments": "{}",
+                    "arguments": _dispense_medicine_tool_arguments(),
                 }
             ]
         _log_serial_servo_tools_missing(
@@ -600,6 +600,21 @@ def _resolve_dispense_medicine_tool_name(conn, functions=None) -> Optional[str]:
     )
 
 
+# 出药电机：反转方向 -500，转动 5 秒后自动停止（与固件 dispense_medicine 默认一致）
+DISPENSE_MEDICINE_MOTOR_SPEED = -500
+DISPENSE_MEDICINE_ROTATE_DURATION_MS = 5000
+
+
+def _dispense_medicine_tool_arguments() -> str:
+    return json.dumps(
+        {
+            "speed": DISPENSE_MEDICINE_MOTOR_SPEED,
+            "rotate_duration_ms": DISPENSE_MEDICINE_ROTATE_DURATION_MS,
+        },
+        ensure_ascii=False,
+    )
+
+
 def _log_serial_servo_tools_missing(conn, context: str):
     names = [
         n
@@ -660,7 +675,7 @@ def _coze_workflow_reply_side_effect_tool_calls(conn, ai_reply: str) -> list:
                 {
                     "id": uuid.uuid4().hex,
                     "name": disp_tool,
-                    "arguments": "{}",
+                    "arguments": _dispense_medicine_tool_arguments(),
                 }
             )
         else:

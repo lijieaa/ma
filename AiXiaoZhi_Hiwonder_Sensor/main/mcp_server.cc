@@ -19,7 +19,7 @@
 #include "freertos/task.h"
 
 #define TAG "MCP"
-#define SERIAL_SERVO_MOTOR_SPEED_DEFAULT (-500)
+#define SERIAL_SERVO_MOTOR_SPEED_DEFAULT 500
 #define SERIAL_SERVO_MOTOR_DURATION_MS_DEFAULT 5000
 
 #define DEFAULT_TOOLCALL_STACK_SIZE 6144
@@ -532,21 +532,15 @@ void McpServer::AddCommonTools() {
                 "【当用户说「直接发放药品」「舵机旋转360度，发放一个药品」（完整指令）或「发放一个药品」「出药」「旋转360度发药」等"
                 "相同意图时，必须调用本工具】\n"
                 "先将舵机上电并切换为电机模式，再启动转动发放一粒药品（模拟旋转360度）。"
-                "默认速度-500（反转方向），默认转动5秒后自动停止；上电不会自动进入电机模式。\n"
-                "参数：speed 为0时用-500；rotate_duration_ms 为转动毫秒数，0表示不自动停止；"
-                "servo_id 为0时用已缓存ID。",
+                "固件固定为正转 speed=500、转动5秒后自动停止，不接受外部 speed/时长参数。\n"
+                "参数：servo_id 为0时用已缓存ID。",
                 PropertyList({
-                    Property("speed", kPropertyTypeInteger, 0),
-                    Property("rotate_duration_ms", kPropertyTypeInteger, SERIAL_SERVO_MOTOR_DURATION_MS_DEFAULT),
                     Property("servo_id", kPropertyTypeInteger, 0),
                 }),
                 [this, &board](const PropertyList& properties) -> ReturnValue {
-                    int speed = properties["speed"].value<int>();
-                    int duration_ms = properties["rotate_duration_ms"].value<int>();
+                    const int speed = SERIAL_SERVO_MOTOR_SPEED_DEFAULT;
+                    const int duration_ms = SERIAL_SERVO_MOTOR_DURATION_MS_DEFAULT;
                     int servo_id = properties["servo_id"].value<int>();
-                    if (speed == 0) {
-                        speed = SERIAL_SERVO_MOTOR_SPEED_DEFAULT;
-                    }
                     if (servo_id == 0) {
                         servo_id = SerialServoID;
                     }

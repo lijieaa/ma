@@ -299,6 +299,52 @@ def _is_set_volume_tool(tool_name: str) -> bool:
     return "set_volume" in low and "audio" in low
 
 
+def _user_voice_command_return_to_standby(query: str) -> bool:
+    """直连 MCP：让小智回到待机状态，停止当前语音采集/对话。"""
+    t = _normalize_voice_command_text(query)
+    if not t:
+        return False
+    low = t.lower()
+    if any(k in low for k in ("standby", "stand_down", "standdown", "idle")):
+        return True
+    phrases = (
+        "小智回到待机状态",
+        "回到待机状态",
+        "返回待机状态",
+        "进入待机状态",
+        "恢复待机状态",
+        "回到待机",
+        "返回待机",
+        "进入待机",
+        "恢复待机",
+        "退下",
+        "你退下",
+        "不用听了",
+        "别听了",
+        "停止采集",
+        "停止收音",
+        "关闭麦克风",
+        "闭麦",
+    )
+    return any(p in t for p in phrases)
+
+
+def _resolve_standby_tool_name(conn, functions=None) -> Optional[str]:
+    return _resolve_device_mcp_tool_name(
+        conn,
+        "standby",
+        "audio_microphone",
+        canonical_dot_name="self.audio_microphone.standby",
+    )
+
+
+def _is_standby_tool(tool_name: str) -> bool:
+    low = (tool_name or "").lower()
+    return "standby" in low and (
+        "audio_microphone" in low or "microphone" in low or "audio" in low
+    )
+
+
 def _friendly_device_mcp_say(text: str) -> str:
     """将设备/视觉接口的技术错误转为可播报的中文说明。"""
     raw = (text or "").strip()
@@ -325,6 +371,8 @@ def _friendly_device_mcp_say(text: str) -> str:
 
 
 def _speak_direct_mcp_tool_result(conn, tool_name: str, result) -> None:
+    if _is_standby_tool(tool_name):
+        return
     if result.action == Action.ERROR:
         text = _friendly_device_mcp_say(
             result.response or result.result or "操作失败"
@@ -365,6 +413,24 @@ def _build_direct_mcp_voice_command_calls(conn, plain_query: str) -> list:
     fh.tool_manager.refresh_tools()
     functions = fh.get_functions()
     norm = _normalize_voice_command_text(plain_query)
+
+    if _user_voice_command_return_to_standby(norm):
+        standby_tool = _resolve_standby_tool_name(conn, functions)
+        if standby_tool and fh.has_tool(standby_tool):
+            conn.logger.bind(tag=TAG).info(
+                "命中语音指令「回到待机状态」(ASR原文: %s)" % plain_query
+            )
+            return [
+                {
+                    "id": uuid.uuid4().hex,
+                    "name": standby_tool,
+                    "arguments": "{}",
+                }
+            ]
+        conn.logger.bind(tag=TAG).warning(
+            "指令「回到待机状态」命中，但未找到 self.audio_microphone.standby"
+        )
+        return []
 
     if _user_voice_command_start_mlx_module(norm):
         mlx_tool = _resolve_mlx90614_tool_name(conn, functions)
@@ -2114,6 +2180,7 @@ class ConnectionHandler:
                     _is_dispense_medicine_tool(tool_name)
                     or _is_set_volume_tool(tool_name)
                     or _is_take_photo_tool(tool_name)
+                    or _is_standby_tool(tool_name)
                 ):
                     _speak_direct_mcp_tool_result(self, tool_name, result)
 
@@ -2200,6 +2267,9 @@ class ConnectionHandler:
                         )
                     continue
                 if _is_set_volume_tool(tool_name):
+                    _speak_direct_mcp_tool_result(self, tool_name, result)
+                    continue
+                if _is_standby_tool(tool_name):
                     _speak_direct_mcp_tool_result(self, tool_name, result)
                     continue
                 if _is_take_photo_tool(tool_name):

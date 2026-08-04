@@ -595,6 +595,24 @@ void McpServer::AddCommonTools() {
             return board.GetDeviceStatusJson();
         });
 
+    AddTool("self.audio_microphone.standby",
+        "Return Xiaozhi to standby/idle mode. Use this when the user says: "
+        "\"Xiaozhi, return to standby\", \"go back to standby\", \"stand down\", "
+        "\"stop listening\", or asks Xiaozhi to stop collecting microphone audio.",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            (void)properties;
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() == kDeviceStateSpeaking) {
+                app.AbortSpeaking(kAbortReasonNone);
+            }
+            app.StopListening();
+            app.Schedule([]() {
+                Application::GetInstance().SetDeviceState(kDeviceStateIdle);
+            });
+            return std::string("{\"success\":true,\"state\":\"idle\"}");
+        });
+
     AddTool("self.audio_speaker.set_volume", 
         "设置扬声器音量（0~100）。\n"
         "如果你不知道当前音量，可以先调用 self.get_device_status 再决定设置多少。\n",

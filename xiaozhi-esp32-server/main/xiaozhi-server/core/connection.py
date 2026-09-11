@@ -44,6 +44,12 @@ from core.utils.prompt_manager import PromptManager
 from core.utils.voiceprint_provider import VoiceprintProvider
 from core.utils.util import get_system_error_response
 from core.utils import textUtils
+from core.utils.scripted_reply import (
+    maybe_inject_round7_fallback,
+    parse_scripted_reply,
+    scripted_reply_needs_orchestration,
+    strip_markers,
+)
 
 
 TAG = __name__
@@ -948,6 +954,8 @@ class ConnectionHandler:
         self.client_abort = False
         self.client_is_speaking = False
         self.client_listen_mode = "auto"
+        # 剧本编排出药时抑制 MCP 工具自带 say，避免打断固定话术
+        self.suppress_tool_say = False
 
         # 线程任务相关
         self.loop = None  # 在 handle_connection 中获取运行中的事件循环
@@ -1921,14 +1929,16 @@ class ConnectionHandler:
                 if content is not None and len(content) > 0:
                     if not tool_call_flag:
                         response_message.append(content)
-                        self.tts.tts_text_queue.put(
-                            TTSMessageDTO(
-                                sentence_id=self.sentence_id,
-                                sentence_type=SentenceType.MIDDLE,
-                                content_type=ContentType.TEXT,
-                                content_detail=content,
+                        # 扣子工作流先缓存全文，便于解析 PAUSE/DISPENSE 后再分段播报
+                        if not coze_workflow_only:
+                            self.tts.tts_text_queue.put(
+                                TTSMessageDTO(
+                                    sentence_id=self.sentence_id,
+                                    sentence_type=SentenceType.MIDDLE,
+                                    content_type=ContentType.TEXT,
+                                    content_detail=content,
+                                )
                             )
-                        )
         except Exception as e:
             self.logger.bind(tag=TAG).error(f"LLM stream processing error: {e}")
             self.tts.tts_text_queue.put(
@@ -1948,6 +1958,53 @@ class ConnectionHandler:
                     )
                 )
             return
+
+        # 扣子 /run：带 <<<PAUSE>>> / <<<DISPENSE>>> 时走分段播报编排
+        if (
+            coze_workflow_only
+            and depth == 0
+            and not tool_call_flag
+            and len(response_message) > 0
+        ):
+            full_reply = maybe_inject_round7_fallback("".join(response_message))
+            steps = parse_scripted_reply(full_reply)
+            if scripted_reply_needs_orchestration(steps):
+                clean_text = strip_markers(full_reply)
+                self.tts_MessageText = clean_text
+                self.dialogue.put(Message(role="assistant", content=clean_text))
+                self.logger.bind(tag=TAG).info(
+                    "扣子固定话术命中分段编排（停顿/出药），共 %s 步" % len(steps)
+                )
+                try:
+                    self._play_scripted_coze_reply(steps)
+                except Exception as e:
+                    self.logger.bind(tag=TAG).error(
+                        f"分段话术编排失败: {e}\n{traceback.format_exc()}"
+                    )
+                    # 失败兜底：整段去标记后一次播报
+                    self.tts.tts_one_sentence(
+                        self, ContentType.TEXT, content_detail=clean_text
+                    )
+                    self.tts.tts_text_queue.put(
+                        TTSMessageDTO(
+                            sentence_id=self.sentence_id,
+                            sentence_type=SentenceType.LAST,
+                            content_type=ContentType.ACTION,
+                        )
+                    )
+                response_message.clear()
+                if tool_call_reminder and len(self.dialogue.dialogue) > 0:
+                    self.dialogue.dialogue = [
+                        msg
+                        for msg in self.dialogue.dialogue
+                        if not getattr(msg, "is_temporary", False)
+                    ]
+                return True
+
+            # 无编排标记：把缓存全文送入 TTS，再走原有 side_effect（测温等）
+            self.tts.tts_one_sentence(
+                self, ContentType.TEXT, content_detail=full_reply
+            )
 
         # 扣子 /run：按工作流固定话术触发设备 MCP（不测用户意图、不注入 tool_calling）
         if (
@@ -2113,6 +2170,125 @@ class ConnectionHandler:
 
         return True
 
+    def _wait_tts_playback_done_sync(self, timeout: float = 60.0) -> None:
+        """在 chat 工作线程中等待 TTS 播完（内部把异步等待抛到事件循环）。"""
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                self._wait_tts_playback_done(timeout=timeout), self.loop
+            )
+            fut.result(timeout=timeout + 5.0)
+        except Exception as e:
+            self.logger.bind(tag=TAG).warning(f"等待 TTS 播完异常: {e}")
+
+    async def _wait_tts_playback_done(self, timeout: float = 60.0) -> None:
+        """等待当前句 TTS 文本/音频发送完成且设备结束播报。"""
+        from core.handle.sendAudioHandle import _wait_for_audio_completion
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.client_abort:
+                return
+            text_q = 0
+            audio_q = 0
+            try:
+                text_q = self.tts.tts_text_queue.qsize()
+                audio_q = self.tts.tts_audio_queue.qsize()
+            except Exception:
+                pass
+            speaking = bool(getattr(self, "client_is_speaking", False))
+            if text_q == 0 and audio_q == 0 and not speaking:
+                try:
+                    await _wait_for_audio_completion(self)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.25)
+                if not getattr(self, "client_is_speaking", False):
+                    return
+            await asyncio.sleep(0.1)
+        self.logger.bind(tag=TAG).warning("等待 TTS 播完超时")
+
+    def _speak_segment_and_wait(self, text: str, open_new_sentence: bool) -> None:
+        """播报一段文本并等待播完（同步，在 chat 线程调用）。"""
+        text = (text or "").strip()
+        if not text:
+            return
+        if open_new_sentence:
+            # 上一段 TTS stop 后设备回到 Listening；固件只在 Speaking 状态才解码音频。
+            # 必须再发 tts:start，否则后续 opus 会被设备丢弃（表现为「服务端已发、设备不播」）。
+            from core.handle.sendAudioHandle import send_tts_message
+
+            self.sentence_id = str(uuid.uuid4().hex)
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    send_tts_message(self, "start"), self.loop
+                )
+                fut.result(timeout=5)
+            except Exception as e:
+                self.logger.bind(tag=TAG).warning(f"分段播报重新下发 tts:start 失败: {e}")
+            self.client_is_speaking = True
+            self.client_abort = False
+            self.tts.tts_text_queue.put(
+                TTSMessageDTO(
+                    sentence_id=self.sentence_id,
+                    sentence_type=SentenceType.FIRST,
+                    content_type=ContentType.ACTION,
+                )
+            )
+        self.tts.tts_one_sentence(self, ContentType.TEXT, content_detail=text)
+        self.tts.tts_text_queue.put(
+            TTSMessageDTO(
+                sentence_id=self.sentence_id,
+                sentence_type=SentenceType.LAST,
+                content_type=ContentType.ACTION,
+            )
+        )
+        self._wait_tts_playback_done_sync()
+
+    def _play_scripted_coze_reply(self, steps: list) -> None:
+        """
+        按标记步骤播报：speak → pause → dispense → speak…
+        在 chat 工作线程同步执行，避免与 MCP 的 run_coroutine_threadsafe 死锁。
+        首段复用 chat() 已下发的 FIRST；后续段重新开句。
+        """
+        first_speak_done = False
+        for step in steps:
+            if self.client_abort:
+                break
+            stype = step.get("type")
+            if stype == "speak":
+                self._speak_segment_and_wait(
+                    step.get("text") or "",
+                    open_new_sentence=first_speak_done,
+                )
+                first_speak_done = True
+            elif stype == "pause":
+                seconds = int(step.get("seconds") or 0)
+                self.logger.bind(tag=TAG).info(f"剧本停顿 {seconds} 秒")
+                if seconds > 0:
+                    time.sleep(seconds)
+            elif stype == "dispense":
+                self.logger.bind(tag=TAG).info("剧本触发出药 MCP")
+                disp_tool = _resolve_dispense_medicine_tool_name(self)
+                if not disp_tool:
+                    _log_serial_servo_tools_missing(
+                        self, "剧本 <<<DISPENSE>>> 命中，但未找到 dispense_medicine"
+                    )
+                    continue
+                self.suppress_tool_say = True
+                try:
+                    self._run_mcp_tool_calls(
+                        [
+                            {
+                                "id": uuid.uuid4().hex,
+                                "name": disp_tool,
+                                "arguments": _dispense_medicine_tool_arguments(),
+                            }
+                        ],
+                        depth=0,
+                    )
+                finally:
+                    self.suppress_tool_say = False
+
     def _try_run_direct_mcp_voice_command(self, plain_query: str, depth: int = 0) -> bool:
         """固定语音指令直连设备 MCP，跳过 LLM/扣子。"""
         tool_calls_list = _build_direct_mcp_voice_command_calls(self, plain_query)
@@ -2171,6 +2347,9 @@ class ConnectionHandler:
                 )
 
         if tool_results:
+            # 剧本出药：只执行动作，不走工具结果播报/二次开句
+            if getattr(self, "suppress_tool_say", False):
+                return
             self._handle_function_result(tool_results, depth=depth)
             for result, tool_call_data in tool_results:
                 tool_name = tool_call_data.get("name") or ""
@@ -2184,7 +2363,7 @@ class ConnectionHandler:
                 ):
                     _speak_direct_mcp_tool_result(self, tool_name, result)
 
-        if depth == 0:
+        if depth == 0 and not getattr(self, "suppress_tool_say", False):
             self.tts.tts_text_queue.put(
                 TTSMessageDTO(
                     sentence_id=self.sentence_id,
